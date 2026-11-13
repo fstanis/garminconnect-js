@@ -1,6 +1,7 @@
 import { GarminAuthError, GarminError } from "./errors.js";
 import { Fetcher, type QueryParams } from "./http/fetcher.js";
 import { API_USER_AGENT } from "./auth/constants.js";
+import { exchangeDiveToken } from "./auth/diving.js";
 import {
   exchange,
   login as ssoLogin,
@@ -76,6 +77,7 @@ export class GarminClient {
   #fetcher: Fetcher;
   #tokens: Tokens | null = null;
   #refreshing: Promise<void> | null = null;
+  #diveExchanging: { source: Tokens; promise: Promise<Tokens> } | null = null;
   readonly #loginDelayMs: number | undefined;
 
   /** Creates a client that is not signed in yet: call `login` or `loadTokens` next. */
@@ -163,10 +165,12 @@ export class GarminClient {
    * (never less than the 60 s every call already uses), and returns the current tokens.
    * Ordinary calls refresh on their own; this is for servers that carry tokens outside a
    * TokenStore and must capture the refreshed pair themselves. Shares an in-flight refresh.
+   * `includeDive` also obtains or renews the separate Dive token within the same margin.
    */
-  async refreshTokens(options: { withinMs?: number } = {}): Promise<Tokens> {
+  async refreshTokens(options: { withinMs?: number; includeDive?: boolean } = {}): Promise<Tokens> {
     const withinSeconds = Math.max(60, Math.ceil((options.withinMs ?? 0) / 1000));
-    return this.#ensureFresh(withinSeconds);
+    const tokens = await this.#ensureFresh(withinSeconds);
+    return options.includeDive ? this.#ensureDive(tokens, withinSeconds) : tokens;
   }
 
   async #ensureFresh(marginSeconds = 60): Promise<Tokens> {
@@ -189,7 +193,7 @@ export class GarminClient {
     const refreshing = (this.#refreshing ??= (async () => {
       try {
         const oauth2 = await exchange(tokens.oauth1, this.#ssoContext);
-        await this.#persist({ oauth1: tokens.oauth1, oauth2 });
+        await this.#persist({ ...tokens, oauth2 });
       } catch (cause) {
         // Only a dead credential justifies destroying the user's saved tokens,
         // and only a 401 says that. The Fetcher maps 403 to GarminAuthError too,
@@ -228,8 +232,44 @@ export class GarminClient {
     return headers;
   }
 
-  async #apiRequest(path: string, options: ApiOptions = {}): Promise<Response> {
+  /** Saves a separately scoped Dive token; Connect refresh does not invalidate it. */
+  async #ensureDive(tokens: Tokens, marginSeconds = 60): Promise<Tokens> {
+    if (tokens.dive && typeof tokens.dive.access_token === "string" && tokens.dive.access_token &&
+        typeof tokens.dive.token_type === "string" && tokens.dive.token_type &&
+        typeof tokens.dive.scope === "string" && tokens.dive.scope.split(/\s+/).includes("DIVE_API_WRITE") &&
+        !isExpired(tokens.dive, marginSeconds)) return tokens;
+    let pending = this.#diveExchanging;
+    if (pending?.source !== tokens) {
+      const promise = (async () => {
+        const dive = await exchangeDiveToken(this.#fetcher, this.domain, tokens);
+        if (this.#tokens !== tokens) throw new GarminAuthError("Authentication changed during Dive token exchange; retry the request");
+        const updated = { ...tokens, dive };
+        await this.tokenStore.save(updated);
+        if (this.#tokens !== tokens) throw new GarminAuthError("Authentication changed during Dive token exchange; retry the request");
+        this.#tokens = updated;
+        return updated;
+      })();
+      pending = { source: tokens, promise };
+      this.#diveExchanging = pending;
+    }
+    try {
+      return await pending.promise;
+    } finally {
+      if (this.#diveExchanging === pending) this.#diveExchanging = null;
+    }
+  }
+
+  /** Reads retain Connect credentials. Only Dive writes use the narrower token. */
+  async #requestTokens(path: string, method = "GET"): Promise<Tokens> {
     const tokens = await this.#ensureFresh();
+    if (!path.startsWith("/diving/") || !["POST", "PUT", "PATCH", "DELETE"].includes(method.toUpperCase()) ||
+        tokens.oauth2.scope.split(/\s+/).includes("DIVE_API_WRITE")) return tokens;
+    const updated = await this.#ensureDive(tokens);
+    return { ...updated, oauth2: updated.dive! };
+  }
+
+  async #apiRequest(path: string, options: ApiOptions = {}): Promise<Response> {
+    const tokens = await this.#requestTokens(path, options.method);
     return this.#fetcher.request(`https://connectapi.${this.domain}${path}`, {
       method: options.method,
       params: options.params,
@@ -290,7 +330,7 @@ export class GarminClient {
     path = "/upload-service/upload",
     options: Pick<ApiOptions, "timeoutMs" | "headers"> = {},
   ): Promise<unknown> {
-    const tokens = await this.#ensureFresh();
+    const tokens = await this.#requestTokens(path, "POST");
     const form = new FormData();
     form.append("file", file, filename);
     // Content-Type is deliberately unset so fetch adds the multipart boundary.

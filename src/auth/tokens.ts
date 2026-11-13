@@ -26,10 +26,12 @@ export interface OAuth2Token extends RawOAuth2Token {
   refresh_token_expires_at: number;
 }
 
-/** The token pair a `TokenStore` saves and loads. */
+/** Connect credentials and an optional, separately scoped Dive access token. */
 export interface Tokens {
   oauth1: OAuth1Token;
   oauth2: OAuth2Token;
+  /** Obtained lazily for Dive writes. Older stores may omit it; never replaces `oauth2`. */
+  dive?: OAuth2Token;
 }
 
 export function setExpirations(raw: RawOAuth2Token, nowMs: number = Date.now()): OAuth2Token {

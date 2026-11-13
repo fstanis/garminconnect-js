@@ -7,7 +7,7 @@ export interface GarminAuth {
   login(email: string, password: string): Promise<SignInResult>;
   resume(mfaState: MfaState, code: string): Promise<Tokens>;
   profileId(tokens: Tokens): Promise<string>;
-  /** Current tokens, refreshing the OAuth2 token first if it expires within `withinMs`. */
+  /** Both Connect and Dive tokens, renewed before the next sealed access token can expire. */
   refresh(tokens: Tokens, withinMs: number): Promise<Tokens>;
 }
 
@@ -17,26 +17,22 @@ export function garminAuth(options: Omit<GarminClientOptions, "tokenStore"> = {}
     client.setTokens(tokens);
     return client;
   };
-  const tokensOf = (client: GarminClient): Tokens => {
-    const tokens = client.getTokens();
-    if (!tokens) throw new GarminAuthError("Garmin returned no tokens");
-    return tokens;
-  };
   return {
     async login(email, password) {
       const client = new GarminClient(options);
       const result = await client.login(email, password);
-      return result.state === "mfa_required" ? { state: "mfa_required", mfaState: result.mfaState } : { state: "success", tokens: tokensOf(client) };
+      return result.state === "mfa_required" ? { state: "mfa_required", mfaState: result.mfaState } :
+        { state: "success", tokens: await client.refreshTokens({ includeDive: true }) };
     },
     async resume(mfaState, code) {
       const client = new GarminClient(options);
       await client.resumeLogin(mfaState, code);
-      return tokensOf(client);
+      return client.refreshTokens({ includeDive: true });
     },
     async profileId(tokens) {
       return String((await new Garmin(withTokens(tokens)).getUserProfile()).profileId);
     },
-    refresh: (tokens, withinMs) => withTokens(tokens).refreshTokens({ withinMs }),
+    refresh: (tokens, withinMs) => withTokens(tokens).refreshTokens({ withinMs, includeDive: true }),
   };
 }
 
